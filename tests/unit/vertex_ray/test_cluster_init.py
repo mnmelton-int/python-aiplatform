@@ -491,7 +491,7 @@ class TestClusterManagement:
                 network=tc.ProjectConstants.TEST_VPC_NETWORK,
                 ray_version="2.4",
             )
-        e.match(regexp=r"Please use Ray version = 2.9.3")
+        e.match(regexp=r"Please use Ray version = 2.33.0")
 
     def test_create_ray_cluster_head_multinode_error(self):
         with pytest.raises(ValueError) as e:
