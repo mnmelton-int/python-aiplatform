@@ -417,7 +417,8 @@ class TensorBoardUploader(object):
                         plugin_data=metadata.plugin_data.content,
                     )
 
-        self._one_platform_resource_manager.batch_create_runs(run_names)
+        experiment_runs = [run.replace("/", "-").replace("_", "-") for run in run_names]
+        self._one_platform_resource_manager.batch_create_runs(experiment_runs)
         self._one_platform_resource_manager.batch_create_time_series(
             run_tag_name_to_time_series_proto
         )
@@ -451,7 +452,9 @@ class TensorBoardUploader(object):
             )
             run_to_events[profile_run_name] = None
 
-        self._experiment_runs = run_to_events.keys()
+        self._experiment_runs = [
+            run.replace("/", "-").replace("_", "-") for run in run_to_events.keys()
+        ]
 
         with self._tracker.send_tracker():
             self._dispatcher.dispatch_requests(run_to_events)
@@ -761,6 +764,10 @@ class _BaseBatchedRequestSender(object):
         ] = defaultdict(defaultdict)
         self._new_request()
 
+    def _reformat_run_name(self, run_name: str) -> str:
+        """Reformats the run name to be compatible with One Platform."""
+        return run_name.replace("/", "-").replace("_", "-")
+
     def _new_request(self):
         """Allocates a new request and refreshes the budget."""
         self._request = tensorboard_service.WriteTensorboardExperimentDataRequest(
@@ -807,6 +814,7 @@ class _BaseBatchedRequestSender(object):
         metadata: tf.compat.v1.SummaryMetadata,
     ):
         self._num_values += 1
+        run_name = self._reformat_run_name(run_name)
         time_series_data_proto = self._run_to_tag_to_time_series_data[run_name].get(
             value.tag
         )
