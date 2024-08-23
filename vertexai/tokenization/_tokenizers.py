@@ -18,13 +18,18 @@ from typing import (
     Iterable,
     List,
     Sequence,
+    Optional,
+    Union,
 )
 
 from vertexai.generative_models._generative_models import (
     ContentsType,
     Image,
+    Tool,
+    PartsType,
     _validate_contents_type_as_valid_sequence,
     _content_types_to_gapic_contents,
+    _to_content,
 )
 
 from vertexai.tokenization._tokenizer_loading import (
@@ -35,8 +40,10 @@ from vertexai.tokenization._tokenizer_loading import (
 from google.cloud.aiplatform_v1beta1.types import (
     content as gapic_content_types,
     tool as gapic_tool_types,
+    openapi,
 )
 from sentencepiece import sentencepiece_model_pb2
+from google.protobuf import struct_pb2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -134,20 +141,13 @@ class _SentencePieceAdaptor:
 
 def _to_gapic_contents(
     contents: ContentsType,
-) -> gapic_content_types.Content:
+) -> List[gapic_content_types.Content]:
     """Converts a GenerativeModel compatible contents type to a gapic content."""
     _validate_contents_type_as_valid_sequence(contents)
     _assert_no_image_contents_type(contents)
     gapic_contents = _content_types_to_gapic_contents(contents)
-    _assert_text_only_content_types_sequence(gapic_contents)
+    # _assert_text_only_content_types_sequence(gapic_contents)
     return gapic_contents
-
-
-def _content_types_to_string_iterator(contents: ContentsType) -> Iterable[str]:
-    """Converts a GenerativeModel compatible contents type to a list of strings."""
-    gapic_contents = _to_gapic_contents(contents)
-    for content in gapic_contents:
-        yield from _to_string_array(content)
 
 
 def _content_types_to_role_iterator(contents: ContentsType) -> Iterable[str]:
@@ -156,13 +156,6 @@ def _content_types_to_role_iterator(contents: ContentsType) -> Iterable[str]:
     for content in gapic_contents:
         for part in content.parts:
             yield content.role
-
-
-def _to_string_array(content: gapic_content_types.Content) -> Iterable[str]:
-    """Converts a gapic content type to a list of strings."""
-    if not content:
-        raise TypeError("content must not be empty.")
-    return [part.text for part in content.parts]
 
 
 def _assert_no_image_contents_type(contents: ContentsType):
@@ -174,37 +167,12 @@ def _assert_no_image_contents_type(contents: ContentsType):
         raise ValueError("Tokenizers do not support Image content type.")
 
 
-def _assert_text_only_content_types_sequence(
-    contents: List[gapic_content_types.Content],
-):
-    """Asserts that the contents type does not contain any non-text content."""
-    for value in contents:
-        for part in value.parts:
-            _assert_text_only_gapic_part(part)
-
-
-def _assert_text_only_gapic_part(value: gapic_content_types.Part):
-    """Asserts that the gapic content part is a text content type."""
-    if (
-        gapic_content_types.FileData() != value.file_data
-        or gapic_content_types.Blob() != value.inline_data
-        or gapic_tool_types.FunctionCall() != value.function_call
-        or gapic_tool_types.FunctionResponse() != value.function_response
-        or gapic_content_types.VideoMetadata() != value.video_metadata
-    ):
-        raise ValueError("Tokenizers do not support non-text content types.")
-
-
-def _to_canonical_contents_texts(contents: ContentsType) -> Iterable[str]:
-    """Gets the canonical contents."""
-    if isinstance(contents, str):
-        yield contents
-    elif isinstance(contents, Sequence) and all(
-        isinstance(content, str) for content in contents
-    ):
-        yield from contents
-    else:
-        yield from _content_types_to_string_iterator(contents)
+def _is_string_inputs(contents: ContentsType) -> Iterable[str]:
+    return (
+        isinstance(contents, str)
+        or isinstance(contents, Sequence)
+        and all(isinstance(content, str) for content in contents)
+    )
 
 
 def _to_canonical_roles(contents: ContentsType) -> Iterable[str]:
@@ -218,20 +186,226 @@ def _to_canonical_roles(contents: ContentsType) -> Iterable[str]:
         yield from _content_types_to_role_iterator(contents)
 
 
+class _TextsAccumulator:
+    def __init__(self):
+        self._texts = []
+
+    def get_texts(self) -> Iterable[str]:
+        return self._texts
+
+    def add_texts(self, texts: Union[Iterable[str], str]) -> None:
+        if isinstance(texts, str):
+            self._texts.append(texts)
+        else:
+            self._texts.extend(texts)
+
+    def add_content(self, content: gapic_content_types.Content) -> None:
+        counted_content = gapic_content_types.Content()
+        for part in content.parts:
+            counted_part = gapic_content_types.Part()
+            if "file_data" in part or "inline_data" in part or "video_metadata" in part:
+                raise ValueError("Tokenizers do not support non-text content types.")
+            if "function_call" in part:
+                self.add_function_call(part.function_call)
+                counted_part.function_call = part.function_call
+            if "function_response" in part:
+                self.add_function_response(part.function_response)
+                counted_part.function_response = part.function_response
+            if "text" in part:
+                counted_part.text = part.text
+                self._texts.append(part.text)
+            counted_content.parts.append(counted_part)
+        counted_content.role = content.role
+        if content._pb != counted_content._pb:
+            raise ValueError(
+                f"Content contains unsupported types for token counting. Supported fields {counted_content}. Got {content}."
+            )
+
+    def add_function_call(self, function_call: gapic_tool_types.FunctionCall) -> None:
+        """Processes a function call and adds relevant text to the accumulator.
+
+        Args:
+            function_call: The function call to process.
+        """
+        self._texts.append(function_call.name)
+        counted_function_call = gapic_tool_types.FunctionCall(name=function_call.name)
+        counted_struct = self._struct_traverse(function_call._pb.args)
+        counted_function_call.args = counted_struct
+        if counted_function_call._pb != function_call._pb:
+            raise ValueError(
+                f"Function call argument contains unsupported types for token counting. Supported fields {counted_function_call}. Got {function_call}."
+            )
+
+    def add_function_calls(
+        self, function_calls: Iterable[gapic_tool_types.FunctionCall]
+    ) -> None:
+        for function_call in function_calls:
+            self.add_function_call(function_call)
+
+    def add_tool(self, tool: gapic_tool_types.Tool) -> gapic_tool_types.Tool:
+        counted_tool = gapic_tool_types.Tool()
+        for function_declaration in tool.function_declarations:
+            counted_function_declaration = self._function_declaration_traverse(
+                function_declaration
+            )
+            counted_tool.function_declarations.append(counted_function_declaration)
+        if counted_tool._pb != tool._pb:
+            raise ValueError(
+                f"Tool argument contains unsupported types for token counting. Supported fields {counted_tool}. Got {tool}."
+            )
+
+    def add_tools(self, tools: Iterable[gapic_tool_types.Tool]) -> None:
+        for tool in tools:
+            self.add_tool(tool)
+
+    def add_function_responses(
+        self, function_responses: Iterable[gapic_tool_types.FunctionResponse]
+    ) -> None:
+        for function_response in function_responses:
+            self.add_function_response(function_response)
+
+    def add_function_response(
+        self, function_response: gapic_tool_types.FunctionResponse
+    ) -> None:
+        counted_function_response = gapic_tool_types.FunctionResponse()
+        self._texts.append(function_response.name)
+        counted_struct = self._struct_traverse(function_response._pb.response)
+        counted_function_response.name = function_response.name
+        counted_function_response.response = counted_struct
+        if counted_function_response._pb != function_response._pb:
+            raise ValueError(
+                f"Function response argument contains unsupported types for token counting. Supported fields {counted_function_response}. Got {function_response}."
+            )
+
+    def _function_declaration_traverse(
+        self, function_declaration: gapic_tool_types.FunctionDeclaration
+    ) -> gapic_tool_types.FunctionDeclaration:
+        counted_function_declaration = gapic_tool_types.FunctionDeclaration()
+        self._texts.append(function_declaration.name)
+        counted_function_declaration.name = function_declaration.name
+        if function_declaration.description:
+            self._texts.append(function_declaration.description)
+            counted_function_declaration.description = function_declaration.description
+        if function_declaration.parameters:
+            counted_parameters = self._schema_traverse(function_declaration.parameters)
+            counted_function_declaration.parameters = counted_parameters
+        if function_declaration.response:
+            counted_response = self._schema_traverse(function_declaration.response)
+            counted_function_declaration.response = counted_response
+        return counted_function_declaration
+
+    def _schema_traverse(self, schema: openapi.Schema) -> openapi.Schema:
+        """Processes a schema and adds relevant text to the accumulator.
+
+        Args:
+            schema: The schema to process.
+
+        Returns:
+            The new schema object with only countable fields.
+        """
+        counted_schema = openapi.Schema()
+        if "type_" in schema:
+            counted_schema.type = schema.type
+        if "title" in schema:
+            counted_schema.title = schema.title
+        if "default" in schema:
+            counted_schema.default = schema.default
+        if "format_" in schema:
+            self._texts.append(schema.format_)
+            counted_schema.format_ = schema.format_
+        if "description" in schema:
+            self._texts.append(schema.description)
+            counted_schema.description = schema.description
+        if "enum" in schema:
+            self._texts.extend(schema.enum)
+            counted_schema.enum = schema.enum
+        if "required" in schema:
+            self._texts.extend(schema.required)
+            counted_schema.required = schema.required
+        if "items" in schema:
+            counted_schema_items = self._schema_traverse(schema.items)
+            counted_schema.items = counted_schema_items
+        if "properties" in schema:
+            d = {}
+            for key, value in schema.properties.items():
+                self._texts.append(key)
+                counted_value = self._schema_traverse(value)
+                d[key] = counted_value
+            counted_schema.properties.update(d)
+        if "example" in schema:
+            counted_schema_example = self._value_traverse(schema._pb.example)
+            counted_schema.example = counted_schema_example
+        return counted_schema
+
+    def _struct_traverse(self, struct: struct_pb2.Struct) -> struct_pb2.Struct:
+        """Processes a struct and adds relevant text to the accumulator.
+
+        Args:
+            struct: The struct to process.
+
+        Returns:
+            The new struct object with only countable fields.
+        """
+        counted_struct = struct_pb2.Struct()
+        self._texts.extend(list(struct.fields.keys()))
+        for key, val in struct.fields.items():
+            counted_struct_fields = self._value_traverse(val)
+            if isinstance(counted_struct_fields, str):
+                counted_struct.fields[key] = counted_struct_fields
+            else:
+                counted_struct.fields[key].MergeFrom(counted_struct_fields)
+        return counted_struct
+
+    def _value_traverse(self, value: struct_pb2.Value) -> struct_pb2.Value:
+        """Processes a struct field and adds relevant text to the accumulator.
+
+        Args:
+            struct: The struct field to process.
+
+        Returns:
+            The new struct field object with only countable fields.
+        """
+        kind = value.WhichOneof("kind")
+        counted_value = struct_pb2.Value()
+        if kind == "string_value":
+            self._texts.append(value.string_value)
+            counted_value.string_value = value.string_value
+        elif kind == "struct_value":
+            counted_struct = self._struct_traverse(value.struct_value)
+            counted_value.struct_value.MergeFrom(counted_struct)
+        elif kind == "list_value":
+            counted_list_value = struct_pb2.ListValue()
+            for item in value.list_value.values:
+                counted_value = self._value_traverse(item)
+                counted_list_value.values.append(counted_value)
+            counted_value.list_value.MergeFrom(counted_list_value)
+        return counted_value
+
+
 class Tokenizer:
     """A tokenizer that can parse text into tokens."""
 
-    def __init__(self, tokenizer_name: str):
+    def __init__(
+        self, tokenizer_name: str, *, system_instruction: Optional[PartsType] = None
+    ):
         """Initializes the tokenizer.
 
         Do not use this constructor directly. Use get_tokenizer_for_model instead.
 
         Args:
             name: The name of the tokenizer.
+            system_instruction: Default system instruction in tokenization.
+
         """
         self._sentencepiece_adapter = _SentencePieceAdaptor(tokenizer_name)
+        self._system_instruction = system_instruction
 
-    def count_tokens(self, contents: ContentsType) -> CountTokensResult:
+    def count_tokens(
+        self,
+        contents: ContentsType,
+        *,
+        tools: Optional[List["Tool"]] = None,
+    ) -> CountTokensResult:
         r"""Counts the number of tokens in the text-only contents.
 
         Args:
@@ -251,9 +425,24 @@ class Tokenizer:
             the contents.
         """
 
-        return self._sentencepiece_adapter.count_tokens(
-            _to_canonical_contents_texts(contents)
-        )
+        text_accumulator = _TextsAccumulator()
+        if _is_string_inputs(contents):
+            text_accumulator.add_texts(contents)
+        else:
+            gapic_contents = _to_gapic_contents(contents)
+            for content in gapic_contents:
+                text_accumulator.add_content(content)
+
+        if tools:
+            text_accumulator.add_tools((tool._raw_tool for tool in tools))
+
+        if self._system_instruction:
+            if _is_string_inputs(self._system_instruction):
+                text_accumulator.add_texts(self._system_instruction)
+            else:
+                text_accumulator.add_content(_to_content(self._system_instruction))
+
+        return self._sentencepiece_adapter.count_tokens(text_accumulator.get_texts())
 
     def compute_tokens(self, contents: ContentsType) -> ComputeTokensResult:
         r"""Computes the tokens ids and string pieces in the text-only contents.
@@ -273,13 +462,25 @@ class Tokenizer:
             A ComputeTokensResult object containing the tokens ids and string
             pieces in the contents.
         """
+        text_accumulator = _TextsAccumulator()
+        if _is_string_inputs(contents):
+            text_accumulator.add_texts(contents)
+        else:
+            gapic_contents = _to_gapic_contents(contents)
+            for content in gapic_contents:
+                text_accumulator.add_content(content)
+
         return self._sentencepiece_adapter.compute_tokens(
-            contents=_to_canonical_contents_texts(contents),
+            contents=text_accumulator.get_texts(),
             roles=_to_canonical_roles(contents),
         )
 
 
-def get_tokenizer_for_model(model_name: str) -> Tokenizer:
+def get_tokenizer_for_model(
+    model_name: str,
+    *,
+    system_instruction: Optional[PartsType] = None,
+) -> Tokenizer:
     """Returns a tokenizer for the given tokenizer name.
 
     Usage:
@@ -290,8 +491,11 @@ def get_tokenizer_for_model(model_name: str) -> Tokenizer:
 
     Args:
         model_name: Specify the tokenizer is from which model.
+        system_instruction: Default system instruction when using the model.
     """
     if not model_name:
         raise ValueError("model_name must not be empty.")
 
-    return Tokenizer(get_tokenizer_name(model_name))
+    return Tokenizer(
+        get_tokenizer_name(model_name), system_instruction=system_instruction
+    )
