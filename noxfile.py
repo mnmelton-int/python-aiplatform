@@ -201,7 +201,37 @@ def default(session):
 @nox.session(python=UNIT_TEST_PYTHON_VERSIONS)
 def unit(session):
     """Run the unit test suite."""
+    # First run the minimal GenAI tests
+    unit_genai_minimal_dependencies(session)
+
+    # Then run the default full test suite
     default(session)
+
+
+def unit_genai_minimal_dependencies(session):
+    # Install minimal test dependencies, then install this package in-place.
+
+    standard_deps = UNIT_TEST_STANDARD_DEPENDENCIES + UNIT_TEST_DEPENDENCIES
+    session.install(*standard_deps)
+    session.install("-e", ".",)
+
+    # Run py.test against the unit tests.
+    session.run(
+        "py.test",
+        "--quiet",
+        f"--junitxml=unit_{session.python}_sponge_log.xml",
+        "--cov=google",
+        "--cov-append",
+        "--cov-config=.coveragerc",
+        "--cov-report=",
+        "--cov-fail-under=0",
+        "--ignore=tests/unit/vertex_ray",
+        "--ignore=tests/unit/vertex_langchain",
+        "--ignore=tests/unit/architecture",
+        # os.path.join("tests", "unit"),
+        os.path.join("tests", "unit", "vertexai", "test_generative_models.py"),
+        *session.posargs,
+    )
 
 
 @nox.session(python="3.10")
